@@ -130,7 +130,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 .message .sent, .message .received { border-radius: 25px; padding: 15px; max-width: 60%; width: fit-content; }
 .message .sent { background-color: #1982FC; color: white; margin-left: auto; margin-right: 0; }
 .message .sent.iMessage { background-color: #1982FC; }
-.message .sent.sms { background-color: #65c466; }
+.message .sent.sms, .message .sent.SMS { background-color: #65c466; }
 .message .received { background-color: #d8d8d8; color: black; margin-right: auto; margin-left: 0; }
 .message .sent .replies { border-left: dotted white; border-bottom: dotted white; border-bottom-left-radius: 25px; }
 .message .received .replies { border-left: dotted dimgray; border-bottom: dotted dimgray; border-bottom-left-radius: 25px; }
