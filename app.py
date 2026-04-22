@@ -1,0 +1,1072 @@
+#!/usr/bin/env python3
+"""iMessage Search - Flask web app"""
+
+import os
+import re
+import sqlite3
+import io
+import mimetypes
+from pathlib import Path
+from urllib.parse import quote
+from flask import Flask, request, jsonify, Response
+
+DB_PATH      = os.environ.get("DB_PATH", "/data/imessage.db")
+ARCHIVE_ROOT = os.environ.get("ARCHIVE_ROOT", "/archives")
+app = Flask(__name__)
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+def get_phone_to_name():
+    """
+    Build a phone->name map from resolved 1:1 conversations, cached on app.
+    Any conversation whose filename stem is a bare NA phone number (+1XXXXXXXXXX)
+    and whose stored name differs from that number is a resolved mapping.
+    """
+    if not hasattr(app, '_phone_to_name'):
+        conn = get_db()
+        rows = conn.execute("SELECT filename, name FROM conversations").fetchall()
+        conn.close()
+        mapping = {}
+        for row in rows:
+            stem = row['filename'].replace('.html', '')
+            if re.fullmatch(r'\+1\d{10}', stem) and row['name'] != stem:
+                mapping[stem] = row['name']
+        app._phone_to_name = mapping
+    return app._phone_to_name
+
+def resolve_sender(sender):
+    """Substitute a raw phone number sender with a resolved name if known."""
+    if not sender or sender == 'Me':
+        return sender
+    return get_phone_to_name().get(sender, sender)
+
+# ── CSS ───────────────────────────────────────────────────────────────────────
+
+CSS = """
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+       background: #1c1c1e; color: #f2f2f7; height: 100vh; display: flex; flex-direction: column; }
+.header { background: #2c2c2e; padding: 12px 20px; display: flex; align-items: center;
+          gap: 16px; border-bottom: 1px solid #3a3a3c; flex-shrink: 0; }
+.header h1 { font-size: 18px; font-weight: 600; }
+.search-bar { flex: 1; display: flex; gap: 8px; max-width: 600px; }
+.search-bar input { flex: 1; background: #3a3a3c; border: none; border-radius: 10px;
+                    padding: 8px 14px; color: #f2f2f7; font-size: 15px; outline: none; }
+.search-bar input::placeholder { color: #8e8e93; }
+.search-bar button { background: #0a84ff; border: none; border-radius: 10px;
+                     padding: 8px 16px; color: white; font-size: 14px; cursor: pointer; }
+.search-bar button:hover { background: #0071e3; }
+.nav a { color: #0a84ff; text-decoration: none; font-size: 14px; white-space: nowrap; }
+.main { display: flex; flex: 1; overflow: hidden; }
+.conv-list { width: 280px; background: #2c2c2e; border-right: 1px solid #3a3a3c;
+             overflow-y: auto; flex-shrink: 0; }
+.conv-item { padding: 12px 16px; border-bottom: 1px solid #3a3a3c; cursor: pointer; }
+.conv-item:hover { background: #3a3a3c; }
+.conv-item.active { background: #0a84ff20; border-left: 3px solid #0a84ff; }
+.conv-name { font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conv-meta { font-size: 11px; color: #8e8e93; margin-top: 3px; }
+.conv-count { font-size: 11px; color: #636366; }
+.msg-pane { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.pane-header { padding: 10px 16px; background: #2c2c2e; border-bottom: 1px solid #3a3a3c;
+               display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; gap: 8px; }
+.pane-title { font-size: 15px; font-weight: 600; }
+.pane-sub { font-size: 11px; color: #8e8e93; margin-top: 2px; }
+.page-controls { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
+.btn { background: #3a3a3c; border: none; border-radius: 8px; padding: 5px 10px;
+       color: #f2f2f7; cursor: pointer; font-size: 13px; white-space: nowrap; }
+.btn:hover { background: #48484a; }
+.btn:disabled { opacity: 0.35; cursor: default; }
+.btn.primary { background: #0a84ff; }
+.page-input { width: 52px; background: #3a3a3c; border: none; border-radius: 8px;
+              padding: 5px 8px; color: #f2f2f7; font-size: 13px; text-align: center; }
+.page-info { font-size: 12px; color: #8e8e93; white-space: nowrap; }
+.messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 8px; overflow-anchor: none; }
+.msg { display: flex; flex-direction: column; max-width: 65%; }
+.msg.sent { align-self: flex-end; align-items: flex-end; }
+.msg.received { align-self: flex-start; }
+.msg-meta { font-size: 10px; color: #8e8e93; margin-bottom: 3px; padding: 0 4px; }
+.msg-bubble { padding: 10px 14px; border-radius: 18px; font-size: 14px; line-height: 1.4; word-break: break-word; }
+.sent .msg-bubble { background: #0a84ff; color: white; border-bottom-right-radius: 4px; }
+.received .msg-bubble { background: #3a3a3c; color: #f2f2f7; border-bottom-left-radius: 4px; }
+.msg-time { font-size: 10px; color: #8e8e93; margin-top: 3px; padding: 0 4px; }
+.attach-note { font-size: 12px; color: #8e8e93; font-style: italic; }
+.loading-bar { text-align: center; padding: 8px; color: #8e8e93; font-size: 12px; flex-shrink: 0; }
+.date-jump { display: flex; gap: 6px; align-items: center; padding: 6px 16px;
+             background: #2c2c2e; border-bottom: 1px solid #3a3a3c; flex-shrink: 0; }
+.date-jump label { font-size: 11px; color: #8e8e93; white-space: nowrap; }
+.date-jump input[type="month"] { background: #3a3a3c; border: none; border-radius: 8px;
+  padding: 4px 8px; color: #f2f2f7; font-size: 12px; outline: none; cursor: pointer; }
+.date-jump input[type="month"]::-webkit-calendar-picker-indicator { filter: invert(0.8); cursor: pointer; }
+.year-pills { display: flex; gap: 4px; flex-wrap: wrap; flex: 1; }
+.year-pill { background: #3a3a3c; border: none; border-radius: 6px; padding: 3px 8px;
+             color: #8e8e93; font-size: 11px; cursor: pointer; white-space: nowrap; }
+.year-pill:hover { background: #48484a; color: #f2f2f7; }
+.year-pill.active { background: #0a84ff; color: white; }
+.msg-highlight { outline: 2px solid #ffd60a !important; border-radius: 20px !important; outline-offset: 3px !important; }
+.results-pane { flex: 1; overflow-y: auto; padding: 16px; }
+.sort-bar { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; }
+.sort-bar span { font-size: 12px; color: #8e8e93; }
+.result-count { font-size: 13px; color: #8e8e93; margin-bottom: 12px; }
+.result-item { background: #2c2c2e; border-radius: 12px; padding: 14px; margin-bottom: 10px;
+               cursor: pointer; border: 1px solid #3a3a3c; }
+.result-item:hover { background: #3a3a3c; }
+.result-conv { font-size: 12px; color: #0a84ff; margin-bottom: 4px; font-weight: 500; }
+.result-text { font-size: 14px; line-height: 1.4; }
+.result-text mark { background: #ffd60a30; color: #ffd60a; border-radius: 3px; padding: 0 2px; }
+.result-meta { font-size: 11px; color: #8e8e93; margin-top: 6px; }
+.empty { display: flex; align-items: center; justify-content: center; height: 100%;
+         color: #48484a; font-size: 15px; flex-direction: column; gap: 8px; }
+.empty-icon { font-size: 48px; }
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #48484a; border-radius: 3px; }
+
+/* imessage-exporter raw HTML rendering */
+.message { margin: 4px 0; overflow-wrap: break-word; }
+.message .sent, .message .received { border-radius: 25px; padding: 15px; max-width: 60%; width: fit-content; }
+.message .sent { background-color: #1982FC; color: white; margin-left: auto; margin-right: 0; }
+.message .sent.iMessage { background-color: #1982FC; }
+.message .sent.sms { background-color: #65c466; }
+.message .received { background-color: #d8d8d8; color: black; margin-right: auto; margin-left: 0; }
+.message .sent .replies { border-left: dotted white; border-bottom: dotted white; border-bottom-left-radius: 25px; }
+.message .received .replies { border-left: dotted dimgray; border-bottom: dotted dimgray; border-bottom-left-radius: 25px; }
+.received .replies, .sent .replies { margin-top: 1%; padding-left: 1%; padding-right: 1%; }
+.app { background: white; border-radius: 25px; }
+.app a { text-decoration: none; }
+.app_header { border-top-left-radius: 25px; border-top-right-radius: 25px; color: black; }
+.app_header img { border-top-left-radius: 25px; border-top-right-radius: 25px; width: 100%; }
+.app_header .name { color: black; font-weight: 600; padding: 8px 15px; }
+.app_footer { border-bottom-left-radius: 25px; border-bottom-right-radius: 25px; border: thin solid darkgray; color: black; background: lightgray; padding-bottom: 1%; }
+.app_footer .caption { margin-top: 1%; padding: 2px 15px; }
+.app_footer .subcaption { padding: 2px 15px; color: #555; font-size: 0.85em; }
+.app_footer .trailing_caption { text-align: right; padding: 2px 15px; }
+span.timestamp a { color: inherit; text-decoration: none; opacity: 0.6; font-size: 0.8em; }
+span.timestamp { opacity: 0.6; font-size: 0.8em; }
+span.sender { font-weight: 500; font-size: 0.85em; }
+span.bubble { white-space: pre-wrap; overflow-wrap: break-word; }
+span.reply_context { opacity: 0.6; font-size: 0.85em; font-style: italic; display: block; margin-bottom: 4px; }
+.tapbacks { font-size: 0.85em; opacity: 0.75; margin-top: 6px; }
+.tapbacks p { font-size: 0.8em; color: #555; margin-bottom: 2px; }
+.tapback { display: inline-block; margin-right: 6px; }
+.announcement { text-align: center; padding: 8px; color: #666; font-size: 0.85em; }
+.edited { font-size: 0.85em; opacity: 0.8; }
+
+/* Conv list sort bar */
+.conv-sort { display: flex; gap: 4px; padding: 8px 10px; border-bottom: 1px solid #3a3a3c; flex-shrink: 0; }
+.conv-sort button { flex: 1; background: #3a3a3c; border: none; border-radius: 6px; padding: 5px 4px;
+                    color: #8e8e93; font-size: 11px; cursor: pointer; }
+.conv-sort button.active { background: #0a84ff; color: white; }
+.conv-list { display: flex; flex-direction: column; }
+.conv-list .conv-items { overflow-y: auto; flex: 1; }
+
+/* Lightbox */
+#lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.88);
+            z-index: 1000; align-items: center; justify-content: center; cursor: zoom-out; }
+#lightbox.open { display: flex; }
+#lightbox img { max-width: 95vw; max-height: 95vh; border-radius: 8px; object-fit: contain;
+                box-shadow: 0 8px 40px rgba(0,0,0,0.6); }
+
+/* Constrain media to reasonable sizes */
+.message img { max-width: min(360px, 65vw) !important; max-height: 50vh !important; height: auto !important; width: auto !important; border-radius: 12px; display: block; }
+.message video { max-width: min(360px, 65vw) !important; max-height: 50vh !important; border-radius: 12px; display: block; }
+.message .sent, .message .received { max-width: min(500px, 70vw) !important; }
+.message .app_header img { max-width: 100% !important; width: 100% !important; max-height: 200px !important; object-fit: cover; }
+/* Nested reply previews inside a parent bubble: left-aligned, full width */
+.message .replies .message { margin: 0; }
+/* Nested preview bubbles inside a replies div: always left-aligned, full-width.
+   Sent previews inside a received bubble get a slightly lighter blue so text stays readable.
+   Received previews inside a sent bubble get a slightly lighter gray. */
+.message .replies .message .sent,
+.message .replies .message .received { margin-left: 0 !important; margin-right: 0 !important; max-width: 100% !important; width: 100% !important; border-radius: 12px; padding: 6px 10px; }
+.message .sent .replies .message .received { background: rgba(255,255,255,0.25) !important; color: white !important; }
+.message .received .replies .message .sent { background: rgba(25,130,252,0.35) !important; color: white !important; }
+
+@media (prefers-color-scheme: dark) {
+  .message .received { background-color: #3a3a3c; color: #f2f2f7; }
+  .app { background: #2c2c2e; }
+  .app_header { color: #f2f2f7; }
+  .app_footer { background: #3a3a3c; color: #f2f2f7; border-color: #48484a; }
+  .app_footer .caption, .app_footer .subcaption { color: #ebebf5; }
+  .tapbacks p { color: #8e8e93; }
+  .announcement { color: #8e8e93; }
+}
+"""
+
+# ── Index page ────────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    conn = get_db()
+    convs_recent = conn.execute(
+        "SELECT filename, name, msg_count, first_date, last_date FROM conversations ORDER BY last_date DESC NULLS LAST"
+    ).fetchall()
+    convs_alpha = sorted(convs_recent, key=lambda c: (c["name"] or "").lower())
+    conn.close()
+
+    def make_conv_items(convs):
+        return "".join(
+            '<div class="conv-item" data-fn="{fn}" onclick="loadConv(this)">'
+            '<div class="conv-name">{name}</div>'
+            '<div class="conv-meta">{fd} → {ld}</div>'
+            '<div class="conv-count">{cnt:,} messages</div></div>'.format(
+                fn=c["filename"].replace('"', '&quot;'),
+                name=c["name"],
+                fd=(c["first_date"] or "?")[:10],
+                ld=(c["last_date"] or "?")[:10],
+                cnt=c["msg_count"]
+            )
+            for c in convs
+        )
+
+    conv_items_recent = make_conv_items(convs_recent)
+    conv_items_alpha  = make_conv_items(convs_alpha)
+
+    return """<!DOCTYPE html><html><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💬</text></svg>">
+<title>iMessage Search</title><style>""" + CSS + """</style></head><body>
+<div class="header">
+  <h1>💬</h1>
+  <div class="search-bar">
+    <input type="text" id="searchInput" placeholder="Search messages..."
+           onkeydown="if(event.key==='Enter')doSearch()">
+    <button onclick="doSearch()">Search</button>
+  </div>
+  <div class="nav"><a href="/">Conversations</a></div>
+</div>
+<div class="main">
+  <div class="conv-list">
+    <div class="conv-sort">
+      <button id="sortRecent" class="active" onclick="setSort('recent')">Recent</button>
+      <button id="sortAlpha" onclick="setSort('alpha')">A – Z</button>
+    </div>
+    <div class="conv-items" id="convItemsRecent">""" + conv_items_recent + """</div>
+    <div class="conv-items" id="convItemsAlpha" style="display:none">""" + conv_items_alpha + """</div>
+  </div>
+  <div class="msg-pane">
+    <div class="pane-header" id="paneHeader" style="display:none">
+      <div style="min-width:0">
+        <div class="pane-title" id="paneTitle"></div>
+        <div class="pane-sub" id="paneSub"></div>
+      </div>
+      <div class="page-controls">
+        <span class="page-info" id="pageInfo"></span>
+        <button class="btn" id="jumpBottomBtn" onclick="jumpToBottom()" title="Jump to bottom">&#8609;</button>
+      </div>
+    </div>
+    <div class="date-jump" id="dateJump" style="display:none">
+      <label>Jump to:</label>
+      <input type="month" id="monthPicker" onchange="jumpToMonth(this.value)" title="Pick a month">
+      <div class="year-pills" id="yearPills"></div>
+    </div>
+    <div class="messages" id="messages">
+      <div class="empty"><div class="empty-icon">💬</div><div>Select a conversation</div></div>
+    </div>
+    <div class="loading-bar" id="loadingBar" style="display:none">Loading...</div>
+  </div>
+</div>
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+var currentFn   = null;   // active conversation filename
+var totalMsgs   = 0;      // total messages in conversation
+var domStart    = 0;      // row index of first message currently in DOM (0-based)
+var domEnd      = 0;      // row index past last message currently in DOM
+var loading     = false;
+var hlTs        = null;
+var hlMid       = null;
+
+var WIN   = 150;   // messages to fetch per load
+var MAX   = 300;   // max messages to keep in DOM before culling the far end
+var TRIM  = 150;   // how many to cull when MAX is exceeded
+
+// ── Search / sort ─────────────────────────────────────────────────────────────
+function doSearch() {
+  var q = document.getElementById('searchInput').value.trim();
+  if (q) window.location.href = '/search?q=' + encodeURIComponent(q);
+}
+
+function setSort(mode) {
+  document.getElementById('convItemsRecent').style.display = mode === 'recent' ? '' : 'none';
+  document.getElementById('convItemsAlpha').style.display  = mode === 'alpha'  ? '' : 'none';
+  document.getElementById('sortRecent').className = mode === 'recent' ? 'active' : '';
+  document.getElementById('sortAlpha').className  = mode === 'alpha'  ? 'active' : '';
+}
+
+// ── Conversation load ─────────────────────────────────────────────────────────
+function loadConv(el) {
+  var fn = el.getAttribute('data-fn');
+  currentFn = fn; hlTs = null; hlMid = null;
+  document.querySelectorAll('.conv-item').forEach(function(e){ e.classList.remove('active'); });
+  el.classList.add('active');
+  el.scrollIntoView({block: 'nearest'});
+  resetPane();
+  // Load last WIN messages so we start at the bottom
+  fetchRows(null, 'initial-bottom');
+}
+
+function resetPane() {
+  domStart = 0; domEnd = 0; totalMsgs = 0;
+  var c = document.getElementById('messages');
+  c.innerHTML = '';
+}
+
+// ── Core fetch ────────────────────────────────────────────────────────────────
+// mode: 'initial-bottom' | 'initial-row:N' | 'prepend' | 'append'
+// N in initial-row:N is the 0-based target row to center the viewport on.
+// All fetches use ?offset= so the server returns exactly the rows we want
+// and we always know the precise row index of what was returned.
+function fetchRows(unused, mode) {
+  if (loading || !currentFn) return;
+  loading = true;
+  showLoading(true);
+
+  var fetchOffset;  // 0-based row index of first message to fetch
+
+  if (mode === 'initial-bottom') {
+    fetchOffset = totalMsgs > 0 ? Math.max(0, totalMsgs - WIN) : -1;
+  } else if (typeof mode === 'string' && mode.startsWith('initial-row:')) {
+    var targetRow = parseInt(mode.split(':')[1]);
+    fetchOffset = Math.max(0, targetRow - Math.floor(WIN / 2));
+  } else if (typeof mode === 'string' && mode.startsWith('initial-top:')) {
+    // Put the target row at the TOP of the rendered window, not the center.
+    // Used for date/year jumps where you want to read forward from that point.
+    var targetRow = parseInt(mode.split(':')[1]);
+    fetchOffset = Math.max(0, targetRow - 1);  // target becomes first visible row
+  } else if (mode === 'prepend') {
+    fetchOffset = Math.max(0, domStart - WIN);
+  } else { // append
+    fetchOffset = domEnd;
+  }
+
+  console.log('[vscroll] fetchRows mode=' + mode + ' fetchOffset=' + fetchOffset + ' totalMsgs=' + totalMsgs + ' domStart=' + domStart + ' domEnd=' + domEnd);
+
+  var url = '/api/conversation?filename=' + encodeURIComponent(currentFn)
+          + '&per_page=' + WIN
+          + '&offset=' + Math.max(0, fetchOffset);
+
+  fetch(url)
+    .then(function(r){ return r.json(); })
+    .then(function(d) {
+      totalMsgs = d.total;
+      updateHeader(d.name, d.total);
+      if (d.first_date) updateDateJump(d.first_date, d.last_date);
+
+      console.log('[vscroll] response: total=' + d.total + ' offset=' + d.offset + ' count=' + d.count + ' mode=' + mode);
+
+      // If initial-bottom and we fetched offset=0 as probe, re-fetch real tail
+      if (mode === 'initial-bottom' && fetchOffset === -1) {
+        loading = false;
+        fetchOffset = Math.max(0, totalMsgs - WIN);
+        fetchRows(null, 'initial-bottom');
+        return;
+      }
+
+      // d.offset is the actual offset the server used (may differ if clamped)
+      var rowOffset = d.offset;
+      var c = document.getElementById('messages');
+      var html = d.messages.map(function(m){ return renderMsg(m); }).join('');
+
+      if (mode === 'initial-bottom' || (typeof mode === 'string' && (mode.startsWith('initial-row:') || mode.startsWith('initial-top:')))) {
+        c.innerHTML = html;
+        domStart = rowOffset;
+        domEnd   = rowOffset + d.count;
+        if (mode === 'initial-bottom') {
+          attachSentinels();
+          pinToBottom(c);
+        } else {
+          // For initial-row: scroll to target first, THEN attach sentinels.
+          // This prevents the top sentinel from firing before the user has
+          // even seen the highlighted message.
+          var target = c.querySelector('.msg-highlight');
+          if (!target && hlMid) target = c.querySelector('[data-mid="' + hlMid + '"]');
+          if (!target && hlTs) {
+            // Find by timestamp prefix match across all message-rows
+            c.querySelectorAll('.message-row').forEach(function(el) {
+              if (!target) {
+                var ts = el.getAttribute('data-ts') || '';
+                if (ts && hlTs && ts.startsWith(hlTs.slice(0,16))) target = el;
+              }
+            });
+          }
+          console.log('[vscroll] highlight target:', target, 'hlMid=', hlMid);
+          if (target) {
+            target.scrollIntoView({block: 'center'});
+            target.classList.add('msg-highlight');
+            setTimeout(function(){ target.classList.remove('msg-highlight'); }, 2500);
+            // Hold scroll position while images above load and expand layout
+            var targetEl = target;
+            var deadline = Date.now() + 3000;
+            var lastTop = targetEl.getBoundingClientRect().top;
+            function holdPosition() {
+              if (Date.now() > deadline) return;
+              var newTop = targetEl.getBoundingClientRect().top;
+              if (Math.abs(newTop - lastTop) > 2) {
+                targetEl.scrollIntoView({block: 'center'});
+                lastTop = targetEl.getBoundingClientRect().top;
+              }
+              requestAnimationFrame(holdPosition);
+            }
+            requestAnimationFrame(holdPosition);
+          }
+          // For date jumps (initial-top), scroll to top so target is first visible.
+          if (typeof mode === 'string' && mode.startsWith('initial-top:')) {
+            document.getElementById('messages').scrollTop = 0;
+          }
+          // Clear state and stale classes AFTER we've captured target above
+          hlTs = null; hlMid = null;
+          document.querySelectorAll('.message-row.msg-highlight').forEach(function(el){
+            if (el !== target) el.classList.remove('msg-highlight');
+          });
+          // Attach sentinels after a short delay so layout is stable
+          setTimeout(function(){ attachSentinels(); }, 200);
+        }
+      } else if (mode === 'prepend') {
+        var prevH = c.scrollHeight;
+        var s = document.getElementById('topSentinel');
+        if (s) s.remove();
+        c.insertAdjacentHTML('afterbegin', html);
+        domStart = rowOffset;
+        c.scrollTop += c.scrollHeight - prevH;
+        if (domEnd - domStart > MAX) cullBottom(c);
+        attachTopSentinel();
+      } else { // append
+        var s = document.getElementById('botSentinel');
+        if (s) s.remove();
+        c.insertAdjacentHTML('beforeend', html);
+        domEnd = rowOffset + d.count;
+        if (domEnd - domStart > MAX) cullTop(c);
+        attachBotSentinel();
+      }
+
+      loading = false;
+      showLoading(false);
+    })
+    .catch(function(){ loading = false; showLoading(false); });
+}
+
+// ── Sentinel-based IntersectionObserver ───────────────────────────────────────
+var observer = null;
+
+function attachSentinels() {
+  attachTopSentinel();
+  attachBotSentinel();
+}
+
+function attachTopSentinel() {
+  if (domStart <= 0) return;  // nothing above
+  var el = document.createElement('div');
+  el.id = 'topSentinel';
+  el.style.height = '1px';
+  var c = document.getElementById('messages');
+  c.insertAdjacentElement('afterbegin', el);
+  observe(el, function(){ fetchRows(null, 'prepend'); });
+}
+
+function attachBotSentinel() {
+  if (domEnd >= totalMsgs) return;  // nothing below
+  var el = document.createElement('div');
+  el.id = 'botSentinel';
+  el.style.height = '1px';
+  var c = document.getElementById('messages');
+  c.insertAdjacentElement('beforeend', el);
+  observe(el, function(){ fetchRows(null, 'append'); });
+}
+
+function observe(el, cb) {
+  var io = new IntersectionObserver(function(entries) {
+    if (entries[0].isIntersecting && !loading) {
+      io.disconnect();
+      cb();
+    }
+  }, { root: document.getElementById('messages'), rootMargin: '200px' });
+  io.observe(el);
+}
+
+// ── DOM culling ───────────────────────────────────────────────────────────────
+function cullBottom(c) {
+  // Remove last TRIM message divs, update domEnd
+  var msgs = c.querySelectorAll(':scope > .message-row');
+  var remove = msgs.length - (MAX - TRIM);
+  if (remove <= 0) return;
+  for (var i = msgs.length - 1; i >= msgs.length - remove; i--) {
+    msgs[i].remove();
+  }
+  domEnd -= remove;
+  attachBotSentinel();
+}
+
+function cullTop(c) {
+  // Remove first TRIM message divs, update domStart
+  var msgs = c.querySelectorAll(':scope > .message-row');
+  var remove = Math.min(TRIM, msgs.length - (MAX - TRIM));
+  if (remove <= 0) return;
+  var prevH = c.scrollHeight;
+  for (var i = 0; i < remove; i++) {
+    msgs[i].remove();
+  }
+  domStart += remove;
+  c.scrollTop -= prevH - c.scrollHeight;
+  attachTopSentinel();
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function renderMsg(m) {
+  var isHl = (hlMid && m.id === hlMid) ||
+             (!hlMid && hlTs && m.timestamp && m.timestamp.slice(0,19) === hlTs.slice(0,19));
+
+  var inner;
+  if (m.raw_html) {
+    inner = m.raw_html;
+  } else {
+    var dir = m.direction || 'received';
+    var time = m.timestamp
+      ? new Date(m.timestamp).toLocaleString('en-US', {month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'})
+      : (m.timestamp_raw || '');
+    var text = m.text ? esc(m.text) : '';
+    var att = '';
+    if (m.has_attachment && m.attachment_url) {
+      var url = esc(m.attachment_url);
+      var ap = (m.attachment_path || '').toLowerCase();
+      if (ap.match(/[.](mov|mp4|m4v|avi)$/)) {
+        att = '<video controls style="max-width:100%;border-radius:12px;margin-top:4px;" preload="none">'
+            + '<source src="' + url + '" type="video/mp4">'
+            + '<a href="' + url + '" style="color:#0a84ff">&#9654; Download video</a></video>';
+      } else if (ap.match(/[.](heic|heif|jpg|jpeg|png|gif|webp|bmp)$/)) {
+        att = '<img src="' + url + '" style="max-width:100%;border-radius:12px;margin-top:4px;" loading="lazy">';
+      } else {
+        att = '<a href="' + url + '" style="color:#0a84ff">&#128206; ' + esc(m.attachment_path || 'Attachment') + '</a>';
+      }
+    } else if (m.has_attachment) {
+      att = '<div class="attach-note">&#128206; Attachment</div>';
+    }
+    var body = text ? (m.has_attachment ? text + '<br>' + att : text) : (att || '<em style="opacity:0.4">&#8212;</em>');
+    inner = '<div class="msg ' + dir + (isHl ? ' msg-highlight' : '') + '">'
+          + '<div class="msg-meta">' + esc(m.sender || '') + '</div>'
+          + '<div class="msg-bubble">' + body + '</div>'
+          + '<div class="msg-time">' + esc(time) + '</div></div>';
+  }
+
+  var hlClass = isHl ? ' msg-highlight' : '';
+  return '<div class="message-row' + hlClass + '" data-mid="' + esc(m.id || '') + '" data-ts="' + esc(m.timestamp || '') + '">' + inner + '</div>';
+}
+
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ── Reply anchor clicks ────────────────────────────────────────────────────────
+// ⇱ up arrow:   href="#GUID"    → find the PARENT message containing this reply
+// ⇲ down arrow: href="#r-GUID"  → find the standalone reply entry (data-mid=GUID)
+document.addEventListener('click', function(e) {
+  var a = e.target.closest('a[href^="#"]');
+  if (!a || !a.closest('#messages')) return;
+  var href = a.getAttribute('href').slice(1); // strip leading #
+  if (!href || !currentFn) return;
+  e.preventDefault();
+
+  var isUpArrow = !href.startsWith('r-');
+  var lookupId  = href.replace(/^r-/, '');  // plain GUID either way
+
+  if (isUpArrow) {
+    // ⇱ — jump to the PARENT message that contains this GUID in its replies div
+    fetch('/api/reply_parent?filename=' + encodeURIComponent(currentFn) + '&guid=' + encodeURIComponent(lookupId))
+      .then(function(r){ return r.json(); })
+      .then(function(d) {
+        console.log('[vscroll] up-arrow parent lookup: guid=' + lookupId + ' parent_id=' + d.parent_id + ' row=' + d.row);
+        if (!d.row) return;
+        // Check if parent already in DOM
+        var existing = document.querySelector('.message-row[data-mid="' + d.parent_id + '"]');
+        if (existing) { existing.scrollIntoView({block: 'center'}); flashHighlight(existing); return; }
+        hlMid = d.parent_id;
+        resetPane();
+        fetchRows(null, 'initial-row:' + (d.row - 1));
+      });
+  } else {
+    // ⇲ — jump to the standalone reply entry
+    var existing = document.querySelector('.message-row[data-mid="' + lookupId + '"]');
+    if (existing) { existing.scrollIntoView({block: 'center'}); flashHighlight(existing); return; }
+    fetch('/api/message_page?filename=' + encodeURIComponent(currentFn) + '&msg_id=' + encodeURIComponent(lookupId) + '&per_page=' + WIN)
+      .then(function(r){ return r.json(); })
+      .then(function(d) {
+        console.log('[vscroll] down-arrow lookup: lookupId=' + lookupId + ' d.row=' + d.row);
+        if (!d.row) return;
+        hlMid = lookupId;
+        resetPane();
+        fetchRows(null, 'initial-row:' + (d.row - 1));
+      });
+  }
+});
+
+function flashHighlight(el) {
+  el.classList.add('msg-highlight');
+  setTimeout(function(){ el.classList.remove('msg-highlight'); }, 2500);
+}
+
+// ── Jump to bottom ────────────────────────────────────────────────────────────
+function jumpToBottom() {
+  resetPane();
+  fetchRows(null, 'initial-bottom');
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function updateHeader(name, total) {
+  document.getElementById('paneHeader').style.display = 'flex';
+  document.getElementById('paneTitle').textContent = name;
+  document.getElementById('paneSub').textContent = total.toLocaleString() + ' messages';
+  document.getElementById('pageInfo').textContent = total.toLocaleString() + ' messages';
+}
+
+function updateDateJump(firstDate, lastDate) {
+  if (!firstDate || !lastDate) return;
+  var bar = document.getElementById('dateJump');
+  var picker = document.getElementById('monthPicker');
+  var pillsEl = document.getElementById('yearPills');
+
+  bar.style.display = 'flex';
+
+  // Set month picker bounds
+  picker.min = firstDate.slice(0, 7);  // YYYY-MM
+  picker.max = lastDate.slice(0, 7);
+
+  // Build year pills from firstYear to lastYear
+  var firstYear = parseInt(firstDate.slice(0, 4));
+  var lastYear  = parseInt(lastDate.slice(0, 4));
+  pillsEl.innerHTML = '';
+  for (var y = firstYear; y <= lastYear; y++) {
+    var btn = document.createElement('button');
+    btn.className = 'year-pill';
+    btn.textContent = y;
+    btn.setAttribute('data-year', y);
+    btn.onclick = (function(year) {
+      return function() { jumpToYear(year); };
+    })(y);
+    pillsEl.appendChild(btn);
+  }
+}
+
+function jumpToMonth(val) {
+  // val is "YYYY-MM" from the month picker
+  if (!val || !currentFn) return;
+  var ts = val + '-01T00:00:00';
+  fetch('/api/message_page?filename=' + encodeURIComponent(currentFn)
+      + '&timestamp=' + encodeURIComponent(ts) + '&per_page=' + WIN)
+    .then(function(r){ return r.json(); })
+    .then(function(d) {
+      if (!d.row) return;
+      resetPane();
+      fetchRows(null, 'initial-top:' + (d.row - 1));
+    });
+}
+
+function jumpToYear(year) {
+  // Highlight the active year pill
+  document.querySelectorAll('.year-pill').forEach(function(p) {
+    p.classList.toggle('active', parseInt(p.getAttribute('data-year')) === year);
+  });
+  jumpToMonth(year + '-01');
+}
+
+function showLoading(on) {
+  document.getElementById('loadingBar').style.display = on ? 'block' : 'none';
+}
+
+function pinToBottom(c) {
+  // Immediately scroll to bottom, then observe size changes for up to 3s
+  // to handle lazy images and layout settling (browser may defer load events).
+  c.scrollTop = c.scrollHeight;
+  var deadline = Date.now() + 3000;
+  var lastH = c.scrollHeight;
+  function repin() {
+    if (Date.now() > deadline) return;
+    if (c.scrollHeight !== lastH) {
+      lastH = c.scrollHeight;
+      var dist = c.scrollHeight - c.scrollTop - c.clientHeight;
+      if (dist < 600) c.scrollTop = c.scrollHeight;
+    }
+    requestAnimationFrame(repin);
+  }
+  requestAnimationFrame(repin);
+}
+
+// ── Lightbox ──────────────────────────────────────────────────────────────────
+document.addEventListener('click', function(e) {
+  var img = e.target;
+  if (img.tagName !== 'IMG') return;
+  if (!img.closest('#messages')) return;
+  // Don't lightbox if it's inside a reply preview
+  if (img.closest('.replies')) return;
+  document.getElementById('lightboxImg').src = img.src;
+  document.getElementById('lightbox').classList.add('open');
+  e.stopPropagation();
+});
+function closeLightbox() {
+  document.getElementById('lightbox').classList.remove('open');
+  document.getElementById('lightboxImg').src = '';
+}
+document.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeLightbox(); });
+
+// ── Handle URL hash on page load (from search result click) ──────────────────
+document.addEventListener('DOMContentLoaded', function() {
+  var hash = window.location.hash;
+  if (!hash || hash.length < 2) return;
+  var params = new URLSearchParams(hash.slice(1));
+  var fn  = params.get('conv');
+  var ts  = params.get('ts');
+  var mid = params.get('mid');
+  if (!fn) return;
+
+  document.querySelectorAll('.conv-item').forEach(function(el) {
+    if (el.getAttribute('data-fn') === fn) {
+      el.classList.add('active');
+      el.scrollIntoView({block: 'center'});
+    }
+  });
+
+  currentFn = fn;
+  hlTs  = ts  || null;
+  hlMid = mid || null;
+
+  if (ts || mid) {
+    var qs = 'filename=' + encodeURIComponent(fn) + '&per_page=' + WIN;
+    if (mid) qs += '&msg_id=' + encodeURIComponent(mid);
+    else     qs += '&timestamp=' + encodeURIComponent(ts);
+    fetch('/api/message_page?' + qs)
+      .then(function(r){ return r.json(); })
+      .then(function(d) {
+        console.log('[vscroll] message_page response: d.row=' + d.row + ' d.page=' + d.page + ' hlMid=' + hlMid + ' hlTs=' + hlTs);
+        fetchRows(null, 'initial-row:' + (d.row ? d.row - 1 : 0));
+      });
+  } else {
+    fetchRows(null, 'initial-bottom');
+  }
+});
+</script>
+
+<div id="lightbox" onclick="closeLightbox()"><img id="lightboxImg" src="" alt=""></div>
+</body></html>"""
+
+
+# ── API: conversation messages ────────────────────────────────────────────────
+
+@app.route("/api/conversation")
+def api_conversation():
+    filename = request.args.get("filename", "")
+    per_page = min(500, max(10, int(request.args.get("per_page", 100))))
+
+    conn = get_db()
+    conv = conn.execute("SELECT * FROM conversations WHERE filename=?", (filename,)).fetchone()
+    if not conv:
+        conn.close()
+        return jsonify({"error": "Not found"}), 404
+
+    total = conv["msg_count"]
+
+    # Support direct offset param (preferred) or legacy page param
+    if request.args.get("offset") is not None:
+        offset = max(0, int(request.args.get("offset")))
+    else:
+        page   = max(1, int(request.args.get("page", 1)))
+        # Clamp page to valid range server-side
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        page   = min(page, total_pages)
+        offset = (page - 1) * per_page
+
+    msgs = conn.execute("""
+        SELECT id, timestamp, timestamp_raw, sender, text, direction, has_attachment, archive_id, attachment_path, raw_html
+        FROM messages WHERE conversation_id=?
+        ORDER BY timestamp ASC NULLS FIRST, rowid ASC
+        LIMIT ? OFFSET ?
+    """, (conv["id"], per_page, offset)).fetchall()
+    conn.close()
+
+    def msg_dict(m):
+        d = dict(m)
+        aid = str(d.get("archive_id", ""))
+        if d.get("attachment_path") and aid:
+            d["attachment_url"] = "/attachments/" + aid + "/" + d["attachment_path"].replace("attachments/", "", 1)
+        else:
+            d["attachment_url"] = None
+        if d.get("raw_html") and aid:
+            def rewrite_src(m2):
+                p = m2.group(1)
+                return 'src="/attachments/' + aid + '/' + p.replace("attachments/", "", 1) + '"'
+            def rewrite_href(m2):
+                p = m2.group(1)
+                return 'href="/attachments/' + aid + '/' + p.replace("attachments/", "", 1) + '"'
+            d["raw_html"] = re.sub(r'src="(attachments/[^"]+)"', rewrite_src, d["raw_html"])
+            d["raw_html"] = re.sub(r'href="(attachments/[^"]+)"', rewrite_href, d["raw_html"])
+            # Substitute raw phone numbers with resolved names in sender spans
+            def rewrite_sender(m2):
+                return '<span class="sender">' + resolve_sender(m2.group(1)) + '</span>'
+            d["raw_html"] = re.sub(r'<span class="sender">(\+1\d{10})</span>', rewrite_sender, d["raw_html"])
+        # Also resolve sender field used by the fallback (non-raw_html) renderer
+        d["sender"] = resolve_sender(d.get("sender"))
+        return d
+
+    return jsonify({
+        "name":       conv["name"],
+        "total":      total,
+        "offset":     offset,
+        "count":      len(msgs),
+        "first_date": conv["first_date"],
+        "last_date":  conv["last_date"],
+        "messages":   [msg_dict(m) for m in msgs]
+    })
+
+
+# ── API: find which page a message is on ─────────────────────────────────────
+
+@app.route("/api/message_page")
+def api_message_page():
+    filename  = request.args.get("filename", "")
+    msg_id    = request.args.get("msg_id", "")
+    timestamp = request.args.get("timestamp", "")
+    per_page  = min(500, max(10, int(request.args.get("per_page", 100))))
+
+    conn = get_db()
+    conv = conn.execute("SELECT * FROM conversations WHERE filename=?", (filename,)).fetchone()
+    if not conv:
+        conn.close()
+        return jsonify({"error": "Not found"}), 404
+
+    cid = conv["id"]
+
+    if msg_id:
+        target = conn.execute(
+            "SELECT timestamp, rowid FROM messages WHERE id=? AND conversation_id=?",
+            (msg_id, cid)
+        ).fetchone()
+        if target:
+            row_num = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id=? AND "
+                "(timestamp < ? OR (timestamp = ? AND rowid <= ?) OR timestamp IS NULL)",
+                (cid, target["timestamp"], target["timestamp"], target["rowid"])
+            ).fetchone()[0]
+        else:
+            row_num = 1
+    elif timestamp:
+        # Find the first message on or after the target timestamp.
+        # COUNT of messages with timestamp < target gives us the 0-based row
+        # index of that first match, which we return as 1-based row_num.
+        row_num = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id=? AND "
+            "timestamp IS NOT NULL AND timestamp < ?",
+            (cid, timestamp)
+        ).fetchone()[0] + 1  # +1 converts to 1-based
+    else:
+        conn.close()
+        return jsonify({"page": 1, "highlight_ts": None})
+
+    conn.close()
+    page = max(1, (row_num + per_page - 1) // per_page)
+    return jsonify({"page": page, "highlight_ts": timestamp, "row": row_num})
+
+
+# ── API: find parent message of a reply ──────────────────────────────────────
+
+@app.route("/api/reply_parent")
+def api_reply_parent():
+    """Given a reply GUID, find the parent message that contains it in its replies div."""
+    filename = request.args.get("filename", "")
+    guid     = request.args.get("guid", "")
+    if not filename or not guid:
+        return jsonify({"error": "Missing params"}), 400
+
+    conn = get_db()
+    conv = conn.execute("SELECT id FROM conversations WHERE filename=?", (filename,)).fetchone()
+    if not conv:
+        conn.close()
+        return jsonify({"error": "Not found"}), 404
+
+    # Find the message whose raw_html contains this GUID inside a replies div.
+    # The reply div has: id="GUID" on the outer .reply wrapper inside .replies.
+    replies_pat = '%class="replies"%'
+    guid_pat    = f'%id="{guid}"%'
+    row = conn.execute(
+        "SELECT id, rowid FROM messages WHERE conversation_id=? "
+        "AND raw_html LIKE ? AND raw_html LIKE ?",
+        (conv["id"], guid_pat, replies_pat)
+    ).fetchone()
+
+    if not row:
+        conn.close()
+        return jsonify({"row": None})
+
+    row_num = conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE conversation_id=? AND rowid <= ?",
+        (conv["id"], row["rowid"])
+    ).fetchone()[0]
+    conn.close()
+    return jsonify({"parent_id": row["id"], "row": row_num})
+
+
+# ── Search page ───────────────────────────────────────────────────────────────
+
+@app.route("/search")
+def search():
+    query = request.args.get("q", "").strip()
+    sort  = request.args.get("sort", "relevance")
+    results_html = ""
+    count = 0
+    capped = ""
+
+    if query:
+        conn = get_db()
+        order = {
+            "date_desc": "m.timestamp DESC NULLS LAST",
+            "date_asc":  "m.timestamp ASC NULLS FIRST",
+        }.get(sort, "rank")
+
+        # Build FTS query: quote each token and append * for prefix matching.
+        # The porter tokenizer handles stemming (run/running/ran), prefix *
+        # handles partial words (taco/tacos/tacobella).
+        import shlex
+        try:
+            tokens = shlex.split(query)
+        except ValueError:
+            tokens = query.split()
+        fts_query = ' '.join('"' + t.replace('"', '') + '"*' for t in tokens if t)
+
+        rows = conn.execute(
+            "SELECT m.id, m.timestamp, m.sender, m.text, c.filename, c.name, "
+            "snippet(messages_fts, 0, '<mark>', '</mark>', '...', 25) as snip "
+            "FROM messages_fts f "
+            "JOIN messages m ON m.rowid = f.rowid "
+            "JOIN conversations c ON c.id = m.conversation_id "
+            "WHERE messages_fts MATCH ? "
+            "ORDER BY " + order + " LIMIT 500",
+            (fts_query,)
+        ).fetchall()
+        conn.close()
+
+        count = len(rows)
+        if count == 500:
+            capped = " (showing first 500)"
+
+        def card(r):
+            ts     = r["timestamp"][:10] if r["timestamp"] else "?"
+            fn     = r["filename"]
+            rts    = r["timestamp"] or ""
+            rid    = r["id"] or ""
+            name   = r["name"] or ""
+            snip   = r["snip"] or ""
+            sender = resolve_sender(r["sender"] or "") or "Unknown"
+            href = "/#conv=" + quote(fn) + ("&ts=" + quote(rts) if rts else "") + ("&mid=" + quote(rid) if rid else "")
+            return (
+                '<a class="result-item" href="' + href + '" style="display:block;text-decoration:none;color:inherit;">'
+                '<div class="result-conv">' + name + '</div>'
+                '<div class="result-text">' + snip + '</div>'
+                '<div class="result-meta">' + sender + ' &middot; ' + ts + '</div>'
+                '</a>'
+            )
+
+        results_html = "".join(card(r) for r in rows)
+        if not rows:
+            results_html = '<div class="empty"><div class="empty-icon">&#128269;</div><div>No results</div></div>'
+
+    qenc = quote(query)
+    sort_bar = (
+        '<div class="sort-bar"><span>Sort by:</span>'
+        '<a href="/search?q={q}&sort=relevance" class="btn {r}">Relevance</a>'
+        '<a href="/search?q={q}&sort=date_desc" class="btn {dd}">Newest</a>'
+        '<a href="/search?q={q}&sort=date_asc" class="btn {da}">Oldest</a></div>'
+    ).format(
+        q=qenc,
+        r="primary" if sort == "relevance" else "",
+        dd="primary" if sort == "date_desc" else "",
+        da="primary" if sort == "date_asc" else "",
+    )
+
+    return (
+        '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💬</text></svg>">'
+        '<title>Search: ' + query + '</title><style>' + CSS + '</style></head><body>'
+        '<div class="header">'
+        '<h1>&#128172;</h1>'
+        '<div class="search-bar">'
+        '<input type="text" id="searchInput" placeholder="Search messages..." value="' + query.replace('"','&quot;') + '"'
+        ' onkeydown="if(event.key===\'Enter\')doSearch()">'
+        '<button onclick="doSearch()">Search</button>'
+        '</div>'
+        '<div class="nav"><a href="/">Conversations</a></div>'
+        '</div>'
+        '<div class="main"><div class="results-pane">'
+        + sort_bar +
+        '<div class="result-count">' + str(count) + ' results for &ldquo;' + query + '&rdquo;' + capped + '</div>'
+        + results_html +
+        '</div></div>'
+        '<script>function doSearch(){var q=document.getElementById("searchInput").value.trim();'
+        'if(q)window.location.href="/search?q="+encodeURIComponent(q);}</script>'
+        '</body></html>'
+    )
+
+
+# ── Stats ─────────────────────────────────────────────────────────────────────
+
+
+# MIME type overrides for browser compatibility
+MIME_OVERRIDES = {
+    '.mov': 'video/mp4',
+    '.MOV': 'video/mp4',
+    '.heic': 'image/jpeg',
+    '.HEIC': 'image/jpeg',
+    '.heif': 'image/jpeg',
+    '.HEIF': 'image/jpeg',
+}
+
+def convert_heic_to_jpeg(path):
+    """Convert HEIC file to JPEG bytes. Returns None if conversion fails."""
+    try:
+        from pillow_heif import register_heif_opener
+        register_heif_opener()
+        from PIL import Image
+        img = Image.open(str(path))
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=85)
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        print(f"HEIC conversion failed for {path}: {e}")
+        return None
+
+
+@app.route("/attachments/<int:archive_id>/<path:filepath>")
+def serve_attachment(archive_id, filepath):
+    """Serve attachment files, converting HEIC to JPEG for browser compatibility."""
+    from flask import send_file, abort
+    conn = get_db()
+    row = conn.execute("SELECT path FROM archives WHERE id=?", (archive_id,)).fetchone()
+    conn.close()
+    if not row:
+        abort(404)
+    full_path = Path(row["path"]) / "attachments" / filepath
+    if not full_path.exists() or not full_path.is_file():
+        abort(404)
+
+    suffix = full_path.suffix
+    # Convert HEIC to JPEG on the fly
+    if suffix.lower() in ('.heic', '.heif'):
+        buf = convert_heic_to_jpeg(full_path)
+        if buf:
+            return Response(buf, mimetype='image/jpeg')
+        # Fall through to serve raw if conversion fails
+
+    # Override MIME type for MOV → video/mp4 so Chrome attempts H.264 playback
+    mime = MIME_OVERRIDES.get(suffix, None) or mimetypes.guess_type(str(full_path))[0] or 'application/octet-stream'
+    return send_file(str(full_path), mimetype=mime)
+
+
+@app.route("/api/stats")
+def stats():
+    conn = get_db()
+    msgs  = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    convs = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+    conn.close()
+    return jsonify({"messages": msgs, "conversations": convs})
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=6333, debug=False)

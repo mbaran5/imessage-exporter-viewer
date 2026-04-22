@@ -1,0 +1,21 @@
+services:
+  imessage-exporter-viewer:
+    # Use pre-built image from Docker Hub:
+    image: mbaran5/imessage-exporter-viewer:latest
+    # Or build locally (comment out image above and uncomment below):
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    container_name: imessage-exporter-viewer
+    ports:
+      - "6333:6333"
+    volumes:
+      - /path/to/your/imessage/exports:/archives:ro
+      - imessage_db:/data
+    environment:
+      - ARCHIVE_ROOT=/archives
+      - DB_PATH=/data/imessage.db
+    restart: unless-stopped
+
+volumes:
+  imessage_db:

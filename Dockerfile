@@ -1,0 +1,23 @@
+FROM python:3.11-slim
+
+LABEL org.opencontainers.image.title="iMessage Search"
+LABEL org.opencontainers.image.description="Self-hosted iMessage search and browser for imessage-exporter archives"
+LABEL org.opencontainers.image.source="https://github.com/mbaran5/imessage-exporter-viewer"
+LABEL org.opencontainers.image.licenses="MIT"
+
+# Install libheif for HEIC support
+RUN apt-get update && apt-get install -y \
+    libheif-dev \
+    libde265-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY indexer.py app.py start.sh ./
+RUN chmod +x start.sh
+
+VOLUME ["/data", "/archives"]
+EXPOSE 6333
+CMD ["/app/start.sh"]
