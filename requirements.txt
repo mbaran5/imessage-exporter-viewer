@@ -1,4 +1,4 @@
 flask==3.0.3
 pillow==10.3.0
 pillow-heif==0.16.0
-ml-mobileclip
+ml-mobileclip @ git+https://github.com/apple/ml-mobileclip.git
