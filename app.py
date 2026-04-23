@@ -194,7 +194,74 @@ span.reply_context { opacity: 0.6; font-size: 0.85em; font-style: italic; displa
   .tapbacks p { color: #8e8e93; }
   .announcement { color: #8e8e93; }
 }
+
+/* Image search */
+.img-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+.img-card { background: #2c2c2e; border-radius: 12px; overflow: hidden;
+            border: 1px solid #3a3a3c; text-decoration: none; color: inherit; display: block; }
+.img-card:hover { border-color: #0a84ff; }
+.img-card img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; background: #3a3a3c; }
+.img-card-meta { padding: 8px 10px; }
+.img-card-conv { font-size: 12px; color: #0a84ff; font-weight: 500;
+                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.img-card-info { font-size: 11px; color: #8e8e93; margin-top: 2px;
+                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.search-bar button.img-btn { background: #48484a; }
+.search-bar button.img-btn:hover { background: #636366; }
+.search-bar button.img-btn.active { background: #0a84ff; }
 """
+
+# ── Image search helpers ──────────────────────────────────────────────────────
+
+_clip_model     = None
+_clip_tokenizer = None
+_emb_cache      = None   # (meta_list, ndarray, count) — invalidated by count change
+
+def _load_clip_model():
+    global _clip_model, _clip_tokenizer
+    if _clip_model is None:
+        import mobileclip
+        model, _, _ = mobileclip.create_model_and_transforms(
+            'mobileclip_s0', pretrained='datacompdr'
+        )
+        model.eval()
+        _clip_model     = model
+        _clip_tokenizer = mobileclip.get_tokenizer('mobileclip_s0')
+    return _clip_model, _clip_tokenizer
+
+
+def _get_emb_matrix():
+    """Return (meta_list, float32 ndarray shape (N,512)) cached in-process."""
+    global _emb_cache
+    import numpy as np
+
+    conn  = get_db()
+    count = conn.execute("SELECT COUNT(*) FROM image_embeddings").fetchone()[0]
+
+    if _emb_cache is not None and _emb_cache[2] == count:
+        conn.close()
+        return _emb_cache[0], _emb_cache[1]
+
+    if count == 0:
+        conn.close()
+        _emb_cache = ([], None, 0)
+        return [], None
+
+    rows = conn.execute("""
+        SELECT e.attachment_path, e.archive_id, e.message_id, e.embedding,
+               m.timestamp, m.sender, c.filename, c.name
+        FROM image_embeddings e
+        JOIN messages m ON m.id = e.message_id
+        JOIN conversations c ON c.id = m.conversation_id
+    """).fetchall()
+    conn.close()
+
+    meta       = [dict(r) for r in rows]
+    all_bytes  = b''.join(bytes(r['embedding']) for r in rows)
+    matrix     = np.frombuffer(all_bytes, dtype=np.float32).reshape(len(rows), 512).copy()
+    _emb_cache = (meta, matrix, count)
+    return meta, matrix
+
 
 # ── Index page ────────────────────────────────────────────────────────────────
 
@@ -234,7 +301,8 @@ def index():
   <div class="search-bar">
     <input type="text" id="searchInput" placeholder="Search messages..."
            onkeydown="if(event.key==='Enter')doSearch()">
-    <button onclick="doSearch()">Search</button>
+    <button onclick="doSearch()">Messages</button>
+    <button onclick="doImageSearch()" class="img-btn">Images</button>
   </div>
   <div class="nav"><a href="/">Conversations</a></div>
 </div>
@@ -287,6 +355,11 @@ var TRIM  = 150;   // how many to cull when MAX is exceeded
 function doSearch() {
   var q = document.getElementById('searchInput').value.trim();
   if (q) window.location.href = '/search?q=' + encodeURIComponent(q);
+}
+
+function doImageSearch() {
+  var q = document.getElementById('searchInput').value.trim();
+  if (q) window.location.href = '/search/images?q=' + encodeURIComponent(q);
 }
 
 function setSort(mode) {
@@ -989,7 +1062,8 @@ def search():
         '<div class="search-bar">'
         '<input type="text" id="searchInput" placeholder="Search messages..." value="' + query.replace('"','&quot;') + '"'
         ' onkeydown="if(event.key===\'Enter\')doSearch()">'
-        '<button onclick="doSearch()">Search</button>'
+        '<button onclick="doSearch()" class="primary">Messages</button>'
+        '<button onclick="doImageSearch()" class="img-btn">Images</button>'
         '</div>'
         '<div class="nav"><a href="/">Conversations</a></div>'
         '</div>'
@@ -998,8 +1072,143 @@ def search():
         '<div class="result-count">' + str(count) + ' results for &ldquo;' + query + '&rdquo;' + capped + '</div>'
         + results_html +
         '</div></div>'
-        '<script>function doSearch(){var q=document.getElementById("searchInput").value.trim();'
-        'if(q)window.location.href="/search?q="+encodeURIComponent(q);}</script>'
+        '<script>'
+        'function doSearch(){var q=document.getElementById("searchInput").value.trim();'
+        'if(q)window.location.href="/search?q="+encodeURIComponent(q);}'
+        'function doImageSearch(){var q=document.getElementById("searchInput").value.trim();'
+        'if(q)window.location.href="/search/images?q="+encodeURIComponent(q);}'
+        '</script>'
+        '</body></html>'
+    )
+
+
+# ── Image search ─────────────────────────────────────────────────────────────
+
+@app.route("/search/images")
+def search_images():
+    import numpy as np
+    from urllib.parse import quote as _q
+
+    query      = request.args.get("q", "").strip()
+    results    = []
+    status_msg = ""
+
+    conn           = get_db()
+    count_embedded = conn.execute("SELECT COUNT(*) FROM image_embeddings").fetchone()[0]
+    conn.close()
+
+    if not query:
+        status_msg = "Enter a query to search your images"
+    elif count_embedded == 0:
+        status_msg = ("Image embeddings not yet available. "
+                      "The indexer is still processing images in the background — "
+                      "check back later.")
+    else:
+        try:
+            model, tokenizer = _load_clip_model()
+            import torch
+            tokens = tokenizer([query])
+            with torch.inference_mode():
+                text_feat = model.encode_text(tokens)
+                text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
+                text_vec  = text_feat.numpy()[0]
+
+            meta, matrix = _get_emb_matrix()
+            if matrix is not None and len(meta) > 0:
+                sims   = matrix @ text_vec
+                top_k  = min(50, len(meta))
+                top_idx = np.argpartition(sims, -top_k)[-top_k:]
+                top_idx = top_idx[np.argsort(sims[top_idx])[::-1]]
+
+                THRESHOLD = 0.15
+                for idx in top_idx:
+                    score = float(sims[idx])
+                    if score < THRESHOLD:
+                        break
+                    r = meta[idx]
+                    results.append({
+                        'att_url':    "/attachments/{}/{}".format(
+                                          r['archive_id'],
+                                          r['attachment_path'].replace('attachments/', '', 1)),
+                        'conv_name':  r['name'] or '',
+                        'filename':   r['filename'] or '',
+                        'timestamp':  r['timestamp'] or '',
+                        'sender':     resolve_sender(r['sender'] or '') or 'Unknown',
+                        'message_id': r['message_id'] or '',
+                    })
+        except Exception as e:
+            status_msg = f"Image search error: {e}"
+
+    # Build results HTML
+    if results:
+        cards = []
+        for r in results:
+            ts   = r['timestamp'][:10] if r['timestamp'] else ''
+            href = "/#conv={}&ts={}&mid={}".format(
+                _q(r['filename']),
+                _q(r['timestamp']),
+                _q(r['message_id']),
+            )
+            cards.append(
+                '<a class="img-card" href="{href}">'
+                '<img src="{img}" loading="lazy"'
+                ' onerror="this.closest(\'.img-card\').style.display=\'none\'">'
+                '<div class="img-card-meta">'
+                '<div class="img-card-conv">{conv}</div>'
+                '<div class="img-card-info">{sender} &middot; {ts}</div>'
+                '</div></a>'.format(
+                    href=href, img=r['att_url'],
+                    conv=r['conv_name'], sender=r['sender'], ts=ts,
+                )
+            )
+        body_html = (
+            '<div class="result-count">{n} images for &ldquo;{q}&rdquo;'
+            ' <span style="color:#636366">(of {total:,} indexed)</span></div>'
+            '<div class="img-grid">{cards}</div>'
+        ).format(n=len(results), q=query, total=count_embedded, cards=''.join(cards))
+    elif status_msg:
+        body_html = (
+            '<div class="empty">'
+            '<div class="empty-icon">&#128444;</div>'
+            '<div style="max-width:360px;text-align:center">{}</div>'
+            '</div>'
+        ).format(status_msg)
+    else:
+        body_html = (
+            '<div class="empty">'
+            '<div class="empty-icon">&#128444;</div>'
+            '<div>No images matched &ldquo;{}&rdquo;</div>'
+            '</div>'
+        ).format(query)
+
+    qenc    = _q(query)
+    img_active = ' active' if True else ''
+    return (
+        '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💬</text></svg>">'
+        '<title>Image Search: ' + query + '</title>'
+        '<style>' + CSS + '</style></head><body>'
+        '<div class="header">'
+        '<h1>&#128172;</h1>'
+        '<div class="search-bar">'
+        '<input type="text" id="searchInput" placeholder="Search images..." value="'
+        + query.replace('"', '&quot;') +
+        '" onkeydown="if(event.key===\'Enter\')doImageSearch()">'
+        '<button onclick="doSearch()">Messages</button>'
+        '<button onclick="doImageSearch()" class="img-btn active">Images</button>'
+        '</div>'
+        '<div class="nav"><a href="/">Conversations</a></div>'
+        '</div>'
+        '<div class="main"><div class="results-pane">'
+        + body_html +
+        '</div></div>'
+        '<script>'
+        'function doSearch(){var q=document.getElementById("searchInput").value.trim();'
+        'if(q)window.location.href="/search?q="+encodeURIComponent(q);}'
+        'function doImageSearch(){var q=document.getElementById("searchInput").value.trim();'
+        'if(q)window.location.href="/search/images?q="+encodeURIComponent(q);}'
+        '</script>'
         '</body></html>'
     )
 
