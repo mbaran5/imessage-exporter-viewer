@@ -210,6 +210,7 @@ span.reply_context { opacity: 0.6; font-size: 0.85em; font-style: italic; displa
 .search-bar button.img-btn { background: #48484a; }
 .search-bar button.img-btn:hover { background: #636366; }
 .search-bar button.img-btn.active { background: #0a84ff; }
+.img-pagination { display: flex; gap: 10px; align-items: center; margin: 10px 0; }
 """
 
 # ── Image search helpers ──────────────────────────────────────────────────────
@@ -1103,9 +1104,12 @@ def search_images():
     import numpy as np
     from urllib.parse import quote as _q
 
-    query      = request.args.get("q", "").strip()
-    results    = []
-    status_msg = ""
+    query    = request.args.get("q", "").strip()
+    page     = max(1, int(request.args.get("page", 1)))
+    per_page = min(200, max(20, int(request.args.get("per_page", 100))))
+
+    all_results = []
+    status_msg  = ""
 
     conn           = get_db()
     count_embedded = conn.execute("SELECT COUNT(*) FROM image_embeddings").fetchone()[0]
@@ -1129,18 +1133,13 @@ def search_images():
 
             meta, matrix = _get_emb_matrix()
             if matrix is not None and len(meta) > 0:
-                sims   = matrix @ text_vec
-                top_k  = min(50, len(meta))
-                top_idx = np.argpartition(sims, -top_k)[-top_k:]
-                top_idx = top_idx[np.argsort(sims[top_idx])[::-1]]
-
-                THRESHOLD = 0.15
-                for idx in top_idx:
-                    score = float(sims[idx])
-                    if score < THRESHOLD:
-                        break
+                sims       = matrix @ text_vec
+                THRESHOLD  = 0.15
+                above      = np.where(sims >= THRESHOLD)[0]
+                sorted_idx = above[np.argsort(sims[above])[::-1]]
+                for idx in sorted_idx:
                     r = meta[idx]
-                    results.append({
+                    all_results.append({
                         'att_url':    "/attachments/{}/{}".format(
                                           r['archive_id'],
                                           r['attachment_path'].replace('attachments/', '', 1)),
@@ -1153,15 +1152,35 @@ def search_images():
         except Exception as e:
             status_msg = f"Image search error: {e}"
 
+    total_results = len(all_results)
+    total_pages   = max(1, (total_results + per_page - 1) // per_page)
+    page          = min(page, total_pages)
+    start         = (page - 1) * per_page
+    results       = all_results[start:start + per_page]
+
+    def page_url(p):
+        return '/search/images?q={}&page={}'.format(_q(query), p)
+
+    def pagination_bar():
+        if total_results <= per_page:
+            return ''
+        prev_lnk = ('<a href="{}" class="btn">&#8592; Prev</a>'.format(page_url(page - 1))
+                    if page > 1 else '<span class="btn" style="opacity:.35">&#8592; Prev</span>')
+        next_lnk = ('<a href="{}" class="btn">Next &#8594;</a>'.format(page_url(page + 1))
+                    if page < total_pages else '<span class="btn" style="opacity:.35">Next &#8594;</span>')
+        return (
+            '<div class="img-pagination">'
+            '{prev}<span class="page-info">Page {cur} of {tot}</span>{next}'
+            '</div>'
+        ).format(prev=prev_lnk, next=next_lnk, cur=page, tot=total_pages)
+
     # Build results HTML
     if results:
         cards = []
         for r in results:
             ts   = r['timestamp'][:10] if r['timestamp'] else ''
             href = "/#conv={}&ts={}&mid={}".format(
-                _q(r['filename']),
-                _q(r['timestamp']),
-                _q(r['message_id']),
+                _q(r['filename']), _q(r['timestamp']), _q(r['message_id']),
             )
             cards.append(
                 '<a class="img-card" href="{href}">'
@@ -1175,28 +1194,29 @@ def search_images():
                     conv=r['conv_name'], sender=r['sender'], ts=ts,
                 )
             )
+        showing = '{}&ndash;{}'.format(start + 1, start + len(results))
+        pag     = pagination_bar()
         body_html = (
-            '<div class="result-count">{n} images for &ldquo;{q}&rdquo;'
-            ' <span style="color:#636366">(of {total:,} indexed)</span></div>'
+            '<div class="result-count">'
+            'Showing {showing} of {n:,} images for &ldquo;{q}&rdquo;'
+            ' <span style="color:#636366">(of {total:,} indexed)</span>'
+            '</div>'
+            '{pag}'
             '<div class="img-grid">{cards}</div>'
-        ).format(n=len(results), q=query, total=count_embedded, cards=''.join(cards))
+            '{pag}'
+        ).format(showing=showing, n=total_results, q=query,
+                 total=count_embedded, cards=''.join(cards), pag=pag)
     elif status_msg:
         body_html = (
-            '<div class="empty">'
-            '<div class="empty-icon">&#128444;</div>'
-            '<div style="max-width:360px;text-align:center">{}</div>'
-            '</div>'
+            '<div class="empty"><div class="empty-icon">&#128444;</div>'
+            '<div style="max-width:360px;text-align:center">{}</div></div>'
         ).format(status_msg)
     else:
         body_html = (
-            '<div class="empty">'
-            '<div class="empty-icon">&#128444;</div>'
-            '<div>No images matched &ldquo;{}&rdquo;</div>'
-            '</div>'
+            '<div class="empty"><div class="empty-icon">&#128444;</div>'
+            '<div>No images matched &ldquo;{}&rdquo;</div></div>'
         ).format(query)
 
-    qenc    = _q(query)
-    img_active = ' active' if True else ''
     return (
         '<!DOCTYPE html><html><head><meta charset="UTF-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -1221,7 +1241,7 @@ def search_images():
         'function doSearch(){var q=document.getElementById("searchInput").value.trim();'
         'if(q)window.location.href="/search?q="+encodeURIComponent(q);}'
         'function doImageSearch(){var q=document.getElementById("searchInput").value.trim();'
-        'if(q)window.location.href="/search/images?q="+encodeURIComponent(q);}'
+        'window.location.href=q?"/search/images?q="+encodeURIComponent(q):"/search/images";}'
         '</script>'
         '</body></html>'
     )
