@@ -373,7 +373,7 @@ function doSearch() {
 
 function doImageSearch() {
   var q = document.getElementById('searchInput').value.trim();
-  if (q) window.location.href = '/search/images?q=' + encodeURIComponent(q);
+  window.location.href = q ? '/search/images?q=' + encodeURIComponent(q) : '/search/images';
 }
 
 function setSort(mode) {
@@ -1090,7 +1090,7 @@ def search():
         'function doSearch(){var q=document.getElementById("searchInput").value.trim();'
         'if(q)window.location.href="/search?q="+encodeURIComponent(q);}'
         'function doImageSearch(){var q=document.getElementById("searchInput").value.trim();'
-        'if(q)window.location.href="/search/images?q="+encodeURIComponent(q);}'
+        'window.location.href=q?"/search/images?q="+encodeURIComponent(q):"/search/images";}'
         '</script>'
         '</body></html>'
     )
