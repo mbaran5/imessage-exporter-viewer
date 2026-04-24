@@ -16,8 +16,22 @@ from datetime import datetime
 
 ARCHIVE_ROOT = os.environ.get("ARCHIVE_ROOT", "/archives")
 DB_PATH      = os.environ.get("DB_PATH", "/data/imessage.db")
+MODEL_DIR    = os.environ.get("MODEL_DIR", "/data/models")
 
 IMAGE_EXTS = frozenset({'.heic', '.heif', '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'})
+
+MOBILECLIP_S0_URL  = "https://docs-assets.developer.apple.com/ml-research/datasets/mobileclip/mobileclip_s0.pt"
+MOBILECLIP_S0_PATH = Path(MODEL_DIR) / "mobileclip_s0.pt"
+
+def ensure_mobileclip_checkpoint():
+    """Download the MobileCLIP-S0 weights on first use (~30 MB)."""
+    MOBILECLIP_S0_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not MOBILECLIP_S0_PATH.exists():
+        import urllib.request
+        print(f"Downloading MobileCLIP-S0 checkpoint to {MOBILECLIP_S0_PATH} ...")
+        urllib.request.urlretrieve(MOBILECLIP_S0_URL, str(MOBILECLIP_S0_PATH))
+        print("Download complete.")
+    return str(MOBILECLIP_S0_PATH)
 
 MONTHS = {
     "Jan":1,"Feb":2,"Mar":3,"Apr":4,"May":5,"Jun":6,
@@ -619,9 +633,10 @@ def embed_images(conn):
         return
 
     total = len(image_rows)
+    ckpt = ensure_mobileclip_checkpoint()
     print(f"Loading MobileCLIP-S0 for {total:,} images...")
     model, _, preprocess = mobileclip.create_model_and_transforms(
-        'mobileclip_s0', pretrained='datacompdr'
+        'mobileclip_s0', pretrained=ckpt
     )
     model.eval()
 

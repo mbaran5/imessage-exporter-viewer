@@ -12,6 +12,7 @@ from flask import Flask, request, jsonify, Response
 
 DB_PATH      = os.environ.get("DB_PATH", "/data/imessage.db")
 ARCHIVE_ROOT = os.environ.get("ARCHIVE_ROOT", "/archives")
+MODEL_DIR    = os.environ.get("MODEL_DIR", "/data/models")
 app = Flask(__name__)
 
 def get_db():
@@ -217,12 +218,25 @@ _clip_model     = None
 _clip_tokenizer = None
 _emb_cache      = None   # (meta_list, ndarray, count) — invalidated by count change
 
+def _mobileclip_checkpoint():
+    """Return local path to MobileCLIP-S0 weights, downloading if needed."""
+    ckpt = Path(MODEL_DIR) / "mobileclip_s0.pt"
+    if not ckpt.exists():
+        import urllib.request
+        ckpt.parent.mkdir(parents=True, exist_ok=True)
+        urllib.request.urlretrieve(
+            "https://docs-assets.developer.apple.com/ml-research/datasets/mobileclip/mobileclip_s0.pt",
+            str(ckpt),
+        )
+    return str(ckpt)
+
+
 def _load_clip_model():
     global _clip_model, _clip_tokenizer
     if _clip_model is None:
         import mobileclip
         model, _, _ = mobileclip.create_model_and_transforms(
-            'mobileclip_s0', pretrained='datacompdr'
+            'mobileclip_s0', pretrained=_mobileclip_checkpoint()
         )
         model.eval()
         _clip_model     = model
