@@ -16,6 +16,22 @@ from datetime import datetime
 
 ARCHIVE_ROOT = os.environ.get("ARCHIVE_ROOT", "/archives")
 DB_PATH      = os.environ.get("DB_PATH", "/data/imessage.db")
+MODEL_DIR    = os.environ.get("MODEL_DIR", "/data/models")
+
+IMAGE_EXTS = frozenset({'.heic', '.heif', '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'})
+
+MOBILECLIP_S0_URL  = "https://docs-assets.developer.apple.com/ml-research/datasets/mobileclip/mobileclip_s0.pt"
+MOBILECLIP_S0_PATH = Path(MODEL_DIR) / "mobileclip_s0.pt"
+
+def ensure_mobileclip_checkpoint():
+    """Download the MobileCLIP-S0 weights on first use (~30 MB)."""
+    MOBILECLIP_S0_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not MOBILECLIP_S0_PATH.exists():
+        import urllib.request
+        print(f"Downloading MobileCLIP-S0 checkpoint to {MOBILECLIP_S0_PATH} ...")
+        urllib.request.urlretrieve(MOBILECLIP_S0_URL, str(MOBILECLIP_S0_PATH))
+        print("Download complete.")
+    return str(MOBILECLIP_S0_PATH)
 
 MONTHS = {
     "Jan":1,"Feb":2,"Mar":3,"Apr":4,"May":5,"Jun":6,
@@ -396,6 +412,15 @@ def init_db(conn):
         CREATE INDEX IF NOT EXISTS idx_conv_last_date ON conversations(last_date DESC);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_content_hash
             ON messages(conversation_id, content_hash);
+
+        CREATE TABLE IF NOT EXISTS image_embeddings (
+            attachment_path TEXT NOT NULL,
+            archive_id      INTEGER NOT NULL,
+            message_id      TEXT NOT NULL,
+            embedding       BLOB NOT NULL,
+            PRIMARY KEY (attachment_path, archive_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_embeddings_msg ON image_embeddings(message_id);
     """)
     conn.commit()
 
@@ -568,6 +593,103 @@ def update_conversation_stats(conn):
     """)
     conn.commit()
 
+# ── Image embedding ───────────────────────────────────────────────────────────
+
+def embed_images(conn):
+    """Embed all un-processed image attachments using MobileCLIP-S0.
+
+    Embeddings are stored as raw float32 blobs (512 dims) in image_embeddings.
+    Incremental: already-embedded (attachment_path, archive_id) pairs are skipped.
+    """
+    try:
+        import torch
+        import numpy as np
+        import mobileclip
+        from PIL import Image
+    except ImportError as e:
+        print(f"Skipping image embedding: {e}")
+        return
+
+    conn.row_factory = sqlite3.Row
+
+    rows = conn.execute("""
+        SELECT m.id, m.attachment_path, m.archive_id, a.path AS archive_path
+        FROM messages m
+        JOIN archives a ON a.id = m.archive_id
+        WHERE m.has_attachment = 1
+          AND m.attachment_path IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM image_embeddings e
+              WHERE e.attachment_path = m.attachment_path
+                AND e.archive_id = m.archive_id
+          )
+    """).fetchall()
+
+    image_rows = [r for r in rows
+                  if Path(r['attachment_path']).suffix.lower() in IMAGE_EXTS]
+
+    if not image_rows:
+        print("Image embedding: nothing new to embed.")
+        return
+
+    total = len(image_rows)
+    ckpt = ensure_mobileclip_checkpoint()
+    print(f"Loading MobileCLIP-S0 for {total:,} images...")
+    model, _, preprocess = mobileclip.create_model_and_transforms(
+        'mobileclip_s0', pretrained=ckpt
+    )
+    model.eval()
+
+    try:
+        from pillow_heif import register_heif_opener
+        register_heif_opener()
+    except Exception:
+        pass
+
+    BATCH = 32
+    done = errors = 0
+
+    for i in range(0, total, BATCH):
+        chunk = image_rows[i:i + BATCH]
+        tensors, valid = [], []
+
+        for row in chunk:
+            full_path = Path(row['archive_path']) / row['attachment_path']
+            if not full_path.exists():
+                errors += 1
+                continue
+            try:
+                img = Image.open(str(full_path)).convert('RGB')
+                tensors.append(preprocess(img))
+                valid.append(row)
+            except Exception:
+                errors += 1
+
+        if not tensors:
+            continue
+
+        with torch.inference_mode():
+            feats = model.encode_image(torch.stack(tensors))
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+            arr   = feats.numpy().astype(np.float32)
+
+        conn.executemany(
+            "INSERT OR REPLACE INTO image_embeddings "
+            "(attachment_path, archive_id, message_id, embedding) VALUES (?,?,?,?)",
+            [(valid[j]['attachment_path'], valid[j]['archive_id'],
+              valid[j]['id'], arr[j].tobytes())
+             for j in range(len(valid))]
+        )
+        conn.commit()
+        done += len(valid)
+
+        if done % 1000 < BATCH or done >= total:
+            pct = 100 * done / total
+            print(f"  Image embedding: {done:,}/{total:,} ({pct:.0f}%)", flush=True)
+
+    print(f"✓ Image embedding: {done:,} embedded, {errors} skipped")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run_indexer():
@@ -638,4 +760,15 @@ def run_indexer():
     conn.close()
 
 if __name__ == "__main__":
-    run_indexer()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == 'embed':
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        init_db(conn)
+        embed_images(conn)
+        conn.close()
+    else:
+        run_indexer()
