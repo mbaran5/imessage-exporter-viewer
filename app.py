@@ -211,6 +211,36 @@ span.reply_context { opacity: 0.6; font-size: 0.85em; font-style: italic; displa
 .search-bar button.img-btn:hover { background: #636366; }
 .search-bar button.img-btn.active { background: #0a84ff; }
 .img-pagination { display: flex; gap: 10px; align-items: center; margin: 10px 0; }
+
+/* ── Mobile back button: hidden on desktop ── */
+.back-btn { display: none !important; }
+
+@media (max-width: 768px) {
+  /* Header: search bar wraps to its own line */
+  .header { flex-wrap: wrap; padding: 8px 12px; gap: 6px; }
+  .search-bar { order: 3; width: 100%; max-width: none; flex: none; }
+  .nav { margin-left: auto; }
+
+  /* Sidebar: full-width, toggled by JS class */
+  .conv-list { width: 100%; border-right: none; }
+  .conv-list.mobile-hidden { display: none !important; }
+
+  /* Message pane: full-width, hidden until a conversation is selected */
+  .msg-pane { width: 100%; }
+  .msg-pane:not(.mobile-visible) { display: none; }
+
+  /* Back button visible on mobile */
+  .back-btn { display: inline-flex !important; }
+
+  /* Wider bubbles on mobile */
+  .msg { max-width: 85%; }
+
+  /* Date-jump bar: allow year pills to wrap */
+  .date-jump { flex-wrap: wrap; }
+
+  /* Tighter pane header padding on small screens */
+  .pane-header { padding: 8px 12px; }
+}
 """
 
 # ── Image search helpers ──────────────────────────────────────────────────────
@@ -332,7 +362,8 @@ def index():
   </div>
   <div class="msg-pane">
     <div class="pane-header" id="paneHeader" style="display:none">
-      <div style="min-width:0">
+      <button class="btn back-btn" id="backBtn" onclick="showConvList()" title="Back to conversations">&#8592; Convos</button>
+      <div style="min-width:0;flex:1">
         <div class="pane-title" id="paneTitle"></div>
         <div class="pane-sub" id="paneSub"></div>
       </div>
@@ -366,6 +397,21 @@ var WIN   = 150;   // messages to fetch per load
 var MAX   = 300;   // max messages to keep in DOM before culling the far end
 var TRIM  = 150;   // how many to cull when MAX is exceeded
 
+// ── Mobile navigation ─────────────────────────────────────────────────────────
+function isMobile() { return window.innerWidth <= 768; }
+
+function showMsgPane() {
+  if (!isMobile()) return;
+  document.querySelector('.msg-pane').classList.add('mobile-visible');
+  document.querySelector('.conv-list').classList.add('mobile-hidden');
+}
+
+function showConvList() {
+  if (!isMobile()) return;
+  document.querySelector('.msg-pane').classList.remove('mobile-visible');
+  document.querySelector('.conv-list').classList.remove('mobile-hidden');
+}
+
 // ── Search / sort ─────────────────────────────────────────────────────────────
 function doSearch() {
   var q = document.getElementById('searchInput').value.trim();
@@ -394,6 +440,7 @@ function loadConv(el) {
   resetPane();
   // Load last WIN messages so we start at the bottom
   fetchRows(null, 'initial-bottom');
+  showMsgPane();
 }
 
 function resetPane() {
@@ -815,6 +862,8 @@ document.addEventListener('DOMContentLoaded', function() {
   currentFn = fn;
   hlTs  = ts  || null;
   hlMid = mid || null;
+
+  showMsgPane();
 
   if (ts || mid) {
     var qs = 'filename=' + encodeURIComponent(fn) + '&per_page=' + WIN;
